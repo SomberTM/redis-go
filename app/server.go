@@ -20,6 +20,7 @@ type RedisServer struct {
 	replOffset int
 	replicaAddresses []net.Addr
 	connections []net.Conn
+	masterConnection net.Conn
 	storedWriteCommands [][]byte
 }
 
@@ -88,11 +89,6 @@ func ToRaw(s string) string {
 	return buf.String()
 }
 
-func (ctx *RequestContext) DecodeSimpleString() string {
-	raw_string := string(ctx.raw)
-	return raw_string[1:len(raw_string) - 2]
-}
-
 func handleConnection(conn net.Conn) {
 	ctx := RequestContext {
 			conn: conn,
@@ -133,13 +129,14 @@ func handleConnection(conn net.Conn) {
 			}
 
 			if data.data_type == Array {
-				value := data.value.([][]byte)
-				strs := make([]string, 0, len(value))
-				for i := 0; i < len(value); i++ {
-					strs = append(strs, string(value[i]))
+				switch value := data.value.(type) {
+					case [][]byte:
+						strs := make([]string, 0, len(value))
+						for i := 0; i < len(value); i++ {
+							strs = append(strs, string(value[i]))
+						}
+						handleCommand(ctx, strs)
 				}
-				fmt.Println("Parsed", strs)
-				handleCommand(ctx, strs)
 			}
 		}
 		
@@ -163,9 +160,9 @@ func handleCommand(ctx RequestContext, s []string) {
 
 	switch command {
 		case "PING":
-			ctx.conn.Write(ToSimpleString("PONG"))
+			response = ToSimpleString("PONG")
 		case "ECHO":
-			ctx.conn.Write(ToBulkString(args[0]))
+			response = ToBulkString(args[0])
 		case "SET":
 			kv[args[0]] = args[1]
 			if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
@@ -183,24 +180,34 @@ func handleCommand(ctx RequestContext, s []string) {
 		case "GET":
 			v, ok := kv[args[0]]
 			if ok {
-				ctx.conn.Write(ToBulkString(v))
+				response = ToBulkString(v)
 			} else {
 				ctx.conn.Write([]byte(NilBulkString))
 			}
 		case "INFO":
 			if len(args) == 0 {
-				ctx.conn.Write(ToSimpleError("Invalid INFO usage"))
-				return
+				response = ToSimpleError("Invalid INFO usage")
+				break
 			}
 
 			switch strings.ToUpper(args[0]) {
 				case "REPLICATION":
-					ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", server.role, server.masterReplid)))
+					response = ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", server.role, server.masterReplid))
 				default:
-					ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
+					response = ToSimpleError("Unsupported INFO argument")
 			}
 		case "REPLCONF":
-			ctx.conn.Write([]byte(OkSimpleString))
+			conf := strings.ToUpper(args[0])
+			switch conf {
+				case "LISTENING-PORT", "CAPA":
+					response = []byte(OkSimpleString)
+				case "GETACK":
+					ctx.conn.Write(ToRespArray([]string{ "REPLCONF", "ACK", "0" }))
+				case "ACK":
+					break
+				default:
+					response = ToSimpleError("Invalid configuration option")
+			}
 		case "PSYNC":
 			ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0", server.masterReplid)))
 			rdb, err := os.ReadFile("data/empty.rdb")
@@ -215,11 +222,13 @@ func handleCommand(ctx RequestContext, s []string) {
 
 			server.AddReplica(ctx.conn)
 			server.WriteStoredCommands(ctx.conn)
+
+			ctx.conn.Write(ToRespArray([]string{ "REPLCONF", "GETACK", "*" }))
 		default:
 			ctx.conn.Write(ToSimpleError("Unsupported command"))
 	}
 
-	if server.role != "slave" && response != nil {
+	if response != nil || (server.role == "slave" && server.masterConnection != ctx.conn) {
 		ctx.conn.Write(response)
 	}
 
@@ -255,6 +264,7 @@ var server RedisServer = RedisServer {
 	replOffset: 0,
 	replicaAddresses: make([]net.Addr, 0, 10),
 	connections: make([]net.Conn, 0, 10),
+	masterConnection: nil,
 	storedWriteCommands: make([][]byte, 0),
 }
 
@@ -287,6 +297,7 @@ func main() {
 				fmt.Println("Failed to connect to master at", address)
 			}
 			fmt.Println("Connected to master at", address)
+			server.masterConnection = mconn
 
 			buf := make([]byte, 4096)
 
