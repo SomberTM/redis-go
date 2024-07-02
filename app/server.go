@@ -105,6 +105,20 @@ func handleCommand(ctx RequestContext) {
 			} else {
 				ctx.conn.Write([]byte(NilBulkString))
 			}
+		case "INFO":
+			if len(args) == 0 {
+				ctx.conn.Write([]byte(ToSimpleError("Invalid INFO usage")))
+				return
+			}
+
+			switch strings.ToUpper(args[0]) {
+				case "REPLICATION":
+					ctx.conn.Write([]byte(ToBulkString("# Replication\nrole:master\nconnected_slaves:0\nmaster_replid:hellomom\nmaster_repl_offset:0\n")))
+				default:
+					ctx.conn.Write([]byte(ToSimpleError("Unsupported INFO argument")))
+			}
+		default:
+			ctx.conn.Write([]byte(ToSimpleError("Unsupported command")))
 	}
 }
 
@@ -144,7 +158,7 @@ func main() {
 		fmt.Println("Failed to bind to port", port)
 		os.Exit(1)
 	}
-
+	fmt.Println("Listening on port", port)
 
 	for {
 		conn, err := l.Accept()
