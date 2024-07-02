@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,40 +14,95 @@ import (
 
 var kv map[string] string = make(map[string]string)
 
+type RedisServer struct {
+	role string
+	masterReplid string
+	replOffset int
+	replicaAddresses []net.Addr
+	connections []net.Conn
+	storedWriteCommands [][]byte
+}
+
+func (ctx *RedisServer) AddReplica(conn net.Conn) {
+	ctx.replicaAddresses = append(ctx.replicaAddresses, conn.RemoteAddr())
+}
+
+func (server *RedisServer) GetReplicaConnections() []net.Conn {
+	connections := make([]net.Conn, 0, len(server.connections))
+	for i := 0; i < len(server.connections); i++ {
+		if slices.Contains(server.replicaAddresses, server.connections[i].RemoteAddr()) {
+			connections = append(connections, server.connections[i])
+		}
+	}
+	return connections
+}
+
+func (server *RedisServer) PropagateToReplicas(b []byte) {
+	if server.role != "master" {
+		return
+	}
+
+	replicas := server.GetReplicaConnections()
+	for i := 0; i < len(replicas); i++ {
+		replica := replicas[i]
+		_, err := replica.Write(b)
+		if err != nil {
+			fmt.Println("Error writing to replica at", replica.RemoteAddr())
+		}
+		fmt.Println("Wrote to replica at", replica.RemoteAddr())
+	}
+}
+
+func (server *RedisServer) AddStoredCommand(c []byte) {
+	server.storedWriteCommands = append(server.storedWriteCommands, c)
+}
+
+func (server *RedisServer) WriteStoredCommands(conn net.Conn) {
+	fmt.Println("Propagating stored commands", server.storedWriteCommands, "to replica at", conn.RemoteAddr())
+	for i := 0; i < len(server.storedWriteCommands); i++ {
+		_, err := conn.Write(server.storedWriteCommands[i])
+		if err != nil {
+			fmt.Println("Error writing stored command", server.storedWriteCommands[i], "to replica at", conn.RemoteAddr())
+		}
+	}
+}
+
+
 type RequestContext struct {
 	conn net.Conn
 	raw []byte
 }
 
-func (ctx *RequestContext) DecodeArray() []string {
+func ToRaw(s string) string {
+	var buf bytes.Buffer
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+			case '\r':
+				buf.WriteString("\\r")
+			case '\n':
+				buf.WriteString("\\n")
+			default:
+				buf.WriteByte(s[i])
+		}
+	}
+	return buf.String()
+}
+
+func (ctx *RequestContext) DecodeSimpleString() string {
 	raw_string := string(ctx.raw)
-	parts := strings.Split(raw_string, "\r\n")
-
-	args := make([]string, 0, 16)
-
-	if len(parts) == 0 {
-		return args
-	}
-
-	n, err := strconv.Atoi(parts[0][1:])
-	if err != nil {
-		fmt.Println("Error parsing RESP array length: ", err.Error())
-	}
-
-	if n == 0 {
-		return args
-	}
-
-	for i := 2; i < len(parts); i += 2 {
-		args = append(args, parts[i])
-	}
-
-	return args
+	return raw_string[1:len(raw_string) - 2]
 }
 
 func handleConnection(conn net.Conn) {
-	buf := make([]byte, 4096)
+	ctx := RequestContext {
+			conn: conn,
+			raw: nil,
+	}
+
+	defer conn.Close()
+
 	for {
+		buf := make([]byte, 4096)
 		n, err := conn.Read(buf)
 		if err != nil {
 			if err == io.EOF {
@@ -59,16 +115,34 @@ func handleConnection(conn net.Conn) {
 
 		if n == 0 {
 			break
-		} else if n < 4096 {
-			buf[n] = 0
-		}
+		} 
 
-		ctx := RequestContext {
-			conn: conn,
-			raw: buf,
-		}
+		// why I have to do this, cry
+		ctx.raw = []byte(strings.ReplaceAll(string(buf), "\x00", ""))
+		parser := NewRespParser(buf)
 
-		handleCommand(ctx)
+		for !parser.Done() {
+			data, err := parser.Next()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+
+				fmt.Println("Error parsing resp request: ", err.Error())
+				continue
+			}
+
+			if data.data_type == Array {
+				value := data.value.([][]byte)
+				strs := make([]string, 0, len(value))
+				for i := 0; i < len(value); i++ {
+					strs = append(strs, string(value[i]))
+				}
+				fmt.Println("Parsed", strs)
+				handleCommand(ctx, strs)
+			}
+		}
+		
 	}
 }
 
@@ -81,90 +155,77 @@ func isReplicatedCommand(c string) bool {
 	return c == "SET"
 }
 
-func handleCommand(ctx RequestContext) {
-	if ctx.raw[0] == '*' {
-		raw := ctx.DecodeArray()
-		command, args := strings.ToUpper(raw[0]), raw[1:]
-		fmt.Println("Handling command", command, "with args", args)
+func handleCommand(ctx RequestContext, s []string) {
+	command, args := strings.ToUpper(s[0]), s[1:]
+	fmt.Println("Handling command", command, "with args", args)
 
-		var response []byte
+	var response []byte
 
-		switch command {
-			case "PING":
-				ctx.conn.Write(ToSimpleString("PONG"))
-			case "ECHO":
-				ctx.conn.Write(ToBulkString(args[0]))
-			case "SET":
-				kv[args[0]] = args[1]
-				if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
-					ms, err := strconv.Atoi(args[3])
+	switch command {
+		case "PING":
+			ctx.conn.Write(ToSimpleString("PONG"))
+		case "ECHO":
+			ctx.conn.Write(ToBulkString(args[0]))
+		case "SET":
+			kv[args[0]] = args[1]
+			if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
+				ms, err := strconv.Atoi(args[3])
 
-					if err != nil {
-						fmt.Println("Error parsing expiry: ", err.Error())
-						ctx.conn.Write(ToSimpleError("Bad request"))
-						return
-					}
-
-					go deleteKeyAfter(args[0], ms)
-				}
-				response = []byte(OkSimpleString)
-			case "GET":
-				v, ok := kv[args[0]]
-				if ok {
-					ctx.conn.Write(ToBulkString(v))
-				} else {
-					ctx.conn.Write([]byte(NilBulkString))
-				}
-			case "INFO":
-				if len(args) == 0 {
-					ctx.conn.Write(ToSimpleError("Invalid INFO usage"))
+				if err != nil {
+					fmt.Println("Error parsing expiry: ", err.Error())
+					ctx.conn.Write(ToSimpleError("Bad request"))
 					return
 				}
 
-				switch strings.ToUpper(args[0]) {
-					case "REPLICATION":
-						ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", role, master_replid)))
-					default:
-						ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
-				}
-			case "REPLCONF":
-				ctx.conn.Write([]byte(OkSimpleString))
-			case "PSYNC":
-				ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0", master_replid)))
-				rdb, err := os.ReadFile("data/empty.rdb")
-				if err != nil {
-					fmt.Println("Error reading empty rdb", err.Error())
-					os.Exit(1)
-				}
-				var buf bytes.Buffer
-				buf.WriteString(fmt.Sprintf("$%d\r\n", len(rdb)))
-				buf.Write(rdb)
-				ctx.conn.Write(buf.Bytes())
-				replica_conns = append(replica_conns, ctx.conn)
-			default:
-				ctx.conn.Write(ToSimpleError("Unsupported command"))
-		}
-
-		if role != "slave" && response != nil {
-			ctx.conn.Write(response)
-		}
-
-		if role == "master" && isReplicatedCommand(command) {
-			fmt.Println("Propagating to", len(replica_conns), "replicas", string(ctx.raw))
-			// buf := make([]byte, 4096)
-			for i := 0; i < len(replica_conns); i++ {
-				conn := replica_conns[i]
-				str := string(ctx.raw)
-				str = strings.Replace(str, "\x00", "", -1)
-				_, err := conn.Write([]byte(str))
-				if err != nil {
-					fmt.Println("Failed to propagate to replica", err.Error())
-					return
-				}
-				fmt.Println("Propagated to", conn.RemoteAddr())
+				go deleteKeyAfter(args[0], ms)
 			}
-			fmt.Println("Propagation complete")
-		}
+			response = []byte(OkSimpleString)
+		case "GET":
+			v, ok := kv[args[0]]
+			if ok {
+				ctx.conn.Write(ToBulkString(v))
+			} else {
+				ctx.conn.Write([]byte(NilBulkString))
+			}
+		case "INFO":
+			if len(args) == 0 {
+				ctx.conn.Write(ToSimpleError("Invalid INFO usage"))
+				return
+			}
+
+			switch strings.ToUpper(args[0]) {
+				case "REPLICATION":
+					ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", server.role, server.masterReplid)))
+				default:
+					ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
+			}
+		case "REPLCONF":
+			ctx.conn.Write([]byte(OkSimpleString))
+		case "PSYNC":
+			ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0", server.masterReplid)))
+			rdb, err := os.ReadFile("data/empty.rdb")
+			if err != nil {
+				fmt.Println("Error reading empty rdb", err.Error())
+				os.Exit(1)
+			}
+			var buf bytes.Buffer
+			buf.WriteString(fmt.Sprintf("$%d\r\n", len(rdb)))
+			buf.Write(rdb)
+			ctx.conn.Write(buf.Bytes())
+
+			server.AddReplica(ctx.conn)
+			server.WriteStoredCommands(ctx.conn)
+		default:
+			ctx.conn.Write(ToSimpleError("Unsupported command"))
+	}
+
+	if server.role != "slave" && response != nil {
+		ctx.conn.Write(response)
+	}
+
+	if server.role == "master" && isReplicatedCommand(command) {
+		server.AddStoredCommand(ctx.raw)
+		server.PropagateToReplicas(ctx.raw)	
 	}
 }
 
@@ -188,9 +249,14 @@ func pargsToMap() map[string] string {
 	return argmap
 }
 
-var master_replid = "hellomom"
-var role string = "master"
-var replica_conns []net.Conn
+var server RedisServer = RedisServer {
+	role: "master",
+	masterReplid: "hellomom",
+	replOffset: 0,
+	replicaAddresses: make([]net.Addr, 0, 10),
+	connections: make([]net.Conn, 0, 10),
+	storedWriteCommands: make([][]byte, 0),
+}
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -212,13 +278,9 @@ func main() {
 
 	master_info, replicaok := args["replicaof"]
 	if replicaok {
-		role = "slave"
+		server.role = "slave"
 		mhost, mport, found := strings.Cut(master_info, " ")
 		if found {
-			if mhost == "localhost" {
-				mhost = "0.0.0.0"
-			}
-
 			address := fmt.Sprintf("%s:%s", mhost, mport)
 			mconn, rerr := net.Dial("tcp", address)
 			if rerr != nil {
@@ -252,6 +314,7 @@ func main() {
 			os.Exit(1)
 		}
 			
+		server.connections = append(server.connections, conn)
 		go handleConnection(conn)
 	}
 }
