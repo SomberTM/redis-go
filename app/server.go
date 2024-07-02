@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var kv map[string] string = make(map[string]string)
@@ -69,6 +70,11 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+func deleteKeyAfter(key string, ms int) {
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+	delete(kv, key)
+}
+
 func handleCommand(ctx RequestContext) {
 	raw := ctx.Decode()
 	command, args := strings.ToUpper(raw[0]), raw[1:]
@@ -80,6 +86,17 @@ func handleCommand(ctx RequestContext) {
 			ctx.conn.Write([]byte(ToBulkString(args[0])))
 		case "SET":
 			kv[args[0]] = args[1]
+			if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
+				ms, err := strconv.Atoi(args[3])
+
+				if err != nil {
+					fmt.Println("Error parsing expiry: ", err.Error())
+					ctx.conn.Write([]byte(ToSimpleError("Bad request")))
+					return
+				}
+
+				go deleteKeyAfter(args[0], ms)
+			}
 			ctx.conn.Write([]byte(OkSimpleString))
 		case "GET":
 			v, ok := kv[args[0]]
