@@ -82,9 +82,9 @@ func handleCommand(ctx RequestContext) {
 
 	switch command {
 		case "PING":
-			ctx.conn.Write([]byte(ToSimpleString("PONG")))
+			ctx.conn.Write(ToSimpleString("PONG"))
 		case "ECHO":
-			ctx.conn.Write([]byte(ToBulkString(args[0])))
+			ctx.conn.Write(ToBulkString(args[0]))
 		case "SET":
 			kv[args[0]] = args[1]
 			if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
@@ -92,7 +92,7 @@ func handleCommand(ctx RequestContext) {
 
 				if err != nil {
 					fmt.Println("Error parsing expiry: ", err.Error())
-					ctx.conn.Write([]byte(ToSimpleError("Bad request")))
+					ctx.conn.Write(ToSimpleError("Bad request"))
 					return
 				}
 
@@ -102,24 +102,24 @@ func handleCommand(ctx RequestContext) {
 		case "GET":
 			v, ok := kv[args[0]]
 			if ok {
-				ctx.conn.Write([]byte(ToBulkString(v)))
+				ctx.conn.Write(ToBulkString(v))
 			} else {
 				ctx.conn.Write([]byte(NilBulkString))
 			}
 		case "INFO":
 			if len(args) == 0 {
-				ctx.conn.Write([]byte(ToSimpleError("Invalid INFO usage")))
+				ctx.conn.Write(ToSimpleError("Invalid INFO usage"))
 				return
 			}
 
 			switch strings.ToUpper(args[0]) {
 				case "REPLICATION":
-					ctx.conn.Write([]byte(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:hellomom\nmaster_repl_offset:0\n", role))))
+					ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:hellomom\nmaster_repl_offset:0\n", role)))
 				default:
-					ctx.conn.Write([]byte(ToSimpleError("Unsupported INFO argument")))
+					ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
 			}
 		default:
-			ctx.conn.Write([]byte(ToSimpleError("Unsupported command")))
+			ctx.conn.Write(ToSimpleError("Unsupported command"))
 	}
 }
 
@@ -168,13 +168,13 @@ func main() {
 	master_info, replicaok := args["replicaof"]
 	if replicaok {
 		role = "slave"
-		host, port, found := strings.Cut(master_info, " ")
+		mhost, mport, found := strings.Cut(master_info, " ")
 		if found {
-			if host == "localhost" {
-				host = "0.0.0.0"
+			if mhost == "localhost" {
+				mhost = "0.0.0.0"
 			}
 
-			address := fmt.Sprintf("%s:%s", host, port)
+			address := fmt.Sprintf("%s:%s", mhost, mport)
 			mconn, rerr := net.Dial("tcp", address)
 			if rerr != nil {
 				fmt.Println("Failed to connect to master at", address)
@@ -183,7 +183,17 @@ func main() {
 			fmt.Println("Connected to master at", address)
 
 			buf := make([]byte, 4096)
-			mconn.Write([]byte(ToRespArray([]string{ "PING" })))
+
+			mconn.Write(ToRespArray([]string{ "PING" }))
+			mconn.Read(buf)
+			
+			mconn.Write(ToRespArray([]string{ "REPLCONF", "listening-port", port }))
+			mconn.Read(buf)
+
+			mconn.Write(ToRespArray([]string{ "REPLCONF", "capa", "psync2" }))
+			mconn.Read(buf)
+
+			mconn.Write(ToRespArray([]string{ "PSYNC", "?", "-1" }))
 			mconn.Read(buf)
 		}
 	}
