@@ -114,12 +114,14 @@ func handleCommand(ctx RequestContext) {
 
 			switch strings.ToUpper(args[0]) {
 				case "REPLICATION":
-					ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:hellomom\nmaster_repl_offset:0\n", role)))
+					ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", role, master_replid)))
 				default:
 					ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
 			}
 		case "REPLCONF":
 			ctx.conn.Write([]byte(OkSimpleString))
+		case "PSYNC":
+			ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0\r\n", master_replid)))
 		default:
 			ctx.conn.Write(ToSimpleError("Unsupported command"))
 	}
@@ -145,6 +147,7 @@ func pargsToMap() map[string] string {
 	return argmap
 }
 
+var master_replid = "hellomom"
 var role string = "master"
 
 
