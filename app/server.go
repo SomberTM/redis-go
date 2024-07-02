@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -17,7 +18,7 @@ type RequestContext struct {
 	raw []byte
 }
 
-func (ctx *RequestContext) Decode() []string {
+func (ctx *RequestContext) DecodeArray() []string {
 	raw_string := string(ctx.raw)
 	parts := strings.Split(raw_string, "\r\n")
 
@@ -76,7 +77,7 @@ func deleteKeyAfter(key string, ms int) {
 }
 
 func handleCommand(ctx RequestContext) {
-	raw := ctx.Decode()
+	raw := ctx.DecodeArray()
 	command, args := strings.ToUpper(raw[0]), raw[1:]
 	fmt.Println("Handling command", command, "with args", args)
 
@@ -121,7 +122,16 @@ func handleCommand(ctx RequestContext) {
 		case "REPLCONF":
 			ctx.conn.Write([]byte(OkSimpleString))
 		case "PSYNC":
-			ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0\r\n", master_replid)))
+			ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0", master_replid)))
+			rdb, err := os.ReadFile("data/empty.rdb")
+			if err != nil {
+				fmt.Println("Error reading empty rdb", err.Error())
+				os.Exit(1)
+			}
+			var buf bytes.Buffer
+			buf.WriteString(fmt.Sprintf("$%d\r\n", len(rdb)))
+			buf.Write(rdb)
+			ctx.conn.Write(buf.Bytes())
 		default:
 			ctx.conn.Write(ToSimpleError("Unsupported command"))
 	}
