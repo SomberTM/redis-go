@@ -113,7 +113,7 @@ func handleCommand(ctx RequestContext) {
 
 			switch strings.ToUpper(args[0]) {
 				case "REPLICATION":
-					ctx.conn.Write([]byte(ToBulkString("# Replication\nrole:master\nconnected_slaves:0\nmaster_replid:hellomom\nmaster_repl_offset:0\n")))
+					ctx.conn.Write([]byte(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:hellomom\nmaster_repl_offset:0\n", role))))
 				default:
 					ctx.conn.Write([]byte(ToSimpleError("Unsupported INFO argument")))
 			}
@@ -142,6 +142,8 @@ func pargsToMap() map[string] string {
 	return argmap
 }
 
+var role string = "master"
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
@@ -151,6 +153,11 @@ func main() {
 	port, ok := args["port"]
 	if !ok {
 		port = "6379"
+	}
+
+	_, ok = args["replicaof"]
+	if ok {
+		role = "slave"
 	}
 
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", port))
