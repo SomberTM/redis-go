@@ -2,9 +2,19 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 )
+
+type RequestContext struct {
+	conn net.Conn
+	raw []byte
+}
+
+func handleConnection(ctx RequestContext) {
+	ctx.conn.Write([]byte("+PONG\r\n"))
+}
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -21,7 +31,31 @@ func main() {
 		fmt.Println("Error accepting connection: ", err.Error())
 		os.Exit(1)
 	}
-	defer conn.Close()
+		
+	buf := make([]byte, 4096)
+	var n int
+	for {
+		n, err = conn.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				conn.Close()	
+				break;
+			}
 
-	conn.Write([]byte("+PONG\r\n"))
+			fmt.Println("Error reading from connection: ", err.Error())
+			os.Exit(1)
+		}
+
+		if n == 0 {
+			break
+		}
+
+		ctx := RequestContext {
+			conn: conn,
+			raw: buf,
+		}
+		go handleConnection(ctx)
+	}
+
+	
 }
