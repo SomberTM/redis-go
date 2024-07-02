@@ -108,15 +108,43 @@ func handleCommand(ctx RequestContext) {
 	}
 }
 
+func pargsToMap() map[string] string {
+	args := os.Args[1:]
+	argmap := make(map[string] string)
+
+	if len(args) == 0 {
+		return argmap
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "--") {
+			arg_value := args[i + 1]
+			argmap[arg[2:]] = arg_value
+			i++
+		}
+	}
+
+	return argmap
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	args := pargsToMap()
+
+	port, ok := args["port"]
+	if !ok {
+		port = "6379"
+	}
+
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", port))
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		fmt.Println("Failed to bind to port", port)
 		os.Exit(1)
 	}
+
 
 	for {
 		conn, err := l.Accept()
