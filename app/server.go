@@ -118,6 +118,8 @@ func handleCommand(ctx RequestContext) {
 				default:
 					ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
 			}
+		case "REPLCONF":
+			ctx.conn.Write([]byte(OkSimpleString))
 		default:
 			ctx.conn.Write(ToSimpleError("Unsupported command"))
 	}

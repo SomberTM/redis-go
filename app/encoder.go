@@ -27,5 +27,6 @@ func ToRespArray(s []string) []byte {
 	for i := 0; i < len(s); i++ {
 		buf.Write(ToBulkString(s[i]))
 	}
+
 	return buf.Bytes()
 }
