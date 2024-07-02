@@ -50,7 +50,6 @@ func handleConnection(conn net.Conn) {
 		n, err := conn.Read(buf)
 		if err != nil {
 			if err == io.EOF {
-				conn.Close()	
 				break;
 			}
 
@@ -60,6 +59,8 @@ func handleConnection(conn net.Conn) {
 
 		if n == 0 {
 			break
+		} else if n < 4096 {
+			buf[n] = 0
 		}
 
 		ctx := RequestContext {
@@ -76,64 +77,94 @@ func deleteKeyAfter(key string, ms int) {
 	delete(kv, key)
 }
 
+func isReplicatedCommand(c string) bool {
+	return c == "SET"
+}
+
 func handleCommand(ctx RequestContext) {
-	raw := ctx.DecodeArray()
-	command, args := strings.ToUpper(raw[0]), raw[1:]
-	fmt.Println("Handling command", command, "with args", args)
+	if ctx.raw[0] == '*' {
+		raw := ctx.DecodeArray()
+		command, args := strings.ToUpper(raw[0]), raw[1:]
+		fmt.Println("Handling command", command, "with args", args)
 
-	switch command {
-		case "PING":
-			ctx.conn.Write(ToSimpleString("PONG"))
-		case "ECHO":
-			ctx.conn.Write(ToBulkString(args[0]))
-		case "SET":
-			kv[args[0]] = args[1]
-			if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
-				ms, err := strconv.Atoi(args[3])
+		var response []byte
 
-				if err != nil {
-					fmt.Println("Error parsing expiry: ", err.Error())
-					ctx.conn.Write(ToSimpleError("Bad request"))
+		switch command {
+			case "PING":
+				ctx.conn.Write(ToSimpleString("PONG"))
+			case "ECHO":
+				ctx.conn.Write(ToBulkString(args[0]))
+			case "SET":
+				kv[args[0]] = args[1]
+				if len(args) > 3 && strings.ToUpper(args[2]) == "PX" {
+					ms, err := strconv.Atoi(args[3])
+
+					if err != nil {
+						fmt.Println("Error parsing expiry: ", err.Error())
+						ctx.conn.Write(ToSimpleError("Bad request"))
+						return
+					}
+
+					go deleteKeyAfter(args[0], ms)
+				}
+				response = []byte(OkSimpleString)
+			case "GET":
+				v, ok := kv[args[0]]
+				if ok {
+					ctx.conn.Write(ToBulkString(v))
+				} else {
+					ctx.conn.Write([]byte(NilBulkString))
+				}
+			case "INFO":
+				if len(args) == 0 {
+					ctx.conn.Write(ToSimpleError("Invalid INFO usage"))
 					return
 				}
 
-				go deleteKeyAfter(args[0], ms)
-			}
-			ctx.conn.Write([]byte(OkSimpleString))
-		case "GET":
-			v, ok := kv[args[0]]
-			if ok {
-				ctx.conn.Write(ToBulkString(v))
-			} else {
-				ctx.conn.Write([]byte(NilBulkString))
-			}
-		case "INFO":
-			if len(args) == 0 {
-				ctx.conn.Write(ToSimpleError("Invalid INFO usage"))
-				return
-			}
+				switch strings.ToUpper(args[0]) {
+					case "REPLICATION":
+						ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", role, master_replid)))
+					default:
+						ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
+				}
+			case "REPLCONF":
+				ctx.conn.Write([]byte(OkSimpleString))
+			case "PSYNC":
+				ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0", master_replid)))
+				rdb, err := os.ReadFile("data/empty.rdb")
+				if err != nil {
+					fmt.Println("Error reading empty rdb", err.Error())
+					os.Exit(1)
+				}
+				var buf bytes.Buffer
+				buf.WriteString(fmt.Sprintf("$%d\r\n", len(rdb)))
+				buf.Write(rdb)
+				ctx.conn.Write(buf.Bytes())
+				replica_conns = append(replica_conns, ctx.conn)
+			default:
+				ctx.conn.Write(ToSimpleError("Unsupported command"))
+		}
 
-			switch strings.ToUpper(args[0]) {
-				case "REPLICATION":
-					ctx.conn.Write(ToBulkString(fmt.Sprintf("# Replication\nrole:%s\nconnected_slaves:0\nmaster_replid:%s\nmaster_repl_offset:0\n", role, master_replid)))
-				default:
-					ctx.conn.Write(ToSimpleError("Unsupported INFO argument"))
+		if role != "slave" && response != nil {
+			ctx.conn.Write(response)
+		}
+
+		if role == "master" && isReplicatedCommand(command) {
+			fmt.Println("Propagating to", len(replica_conns), "replicas", string(ctx.raw))
+			// buf := make([]byte, 4096)
+			for i := 0; i < len(replica_conns); i++ {
+				conn := replica_conns[i]
+				str := string(ctx.raw)
+				str = strings.Replace(str, "\x00", "", -1)
+				_, err := conn.Write([]byte(str))
+				if err != nil {
+					fmt.Println("Failed to propagate to replica", err.Error())
+					return
+				}
+				fmt.Println("Propagated to", conn.RemoteAddr())
 			}
-		case "REPLCONF":
-			ctx.conn.Write([]byte(OkSimpleString))
-		case "PSYNC":
-			ctx.conn.Write(ToSimpleString(fmt.Sprintf("FULLRESYNC %s 0", master_replid)))
-			rdb, err := os.ReadFile("data/empty.rdb")
-			if err != nil {
-				fmt.Println("Error reading empty rdb", err.Error())
-				os.Exit(1)
-			}
-			var buf bytes.Buffer
-			buf.WriteString(fmt.Sprintf("$%d\r\n", len(rdb)))
-			buf.Write(rdb)
-			ctx.conn.Write(buf.Bytes())
-		default:
-			ctx.conn.Write(ToSimpleError("Unsupported command"))
+			fmt.Println("Propagation complete")
+		}
 	}
 }
 
@@ -159,7 +190,7 @@ func pargsToMap() map[string] string {
 
 var master_replid = "hellomom"
 var role string = "master"
-
+var replica_conns []net.Conn
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -179,7 +210,6 @@ func main() {
 	}
 	fmt.Println("Listening on port", port)
 
-
 	master_info, replicaok := args["replicaof"]
 	if replicaok {
 		role = "slave"
@@ -194,7 +224,6 @@ func main() {
 			if rerr != nil {
 				fmt.Println("Failed to connect to master at", address)
 			}
-			defer mconn.Close()
 			fmt.Println("Connected to master at", address)
 
 			buf := make([]byte, 4096)
@@ -210,6 +239,9 @@ func main() {
 
 			mconn.Write(ToRespArray([]string{ "PSYNC", "?", "-1" }))
 			mconn.Read(buf)
+			mconn.Read(buf)
+
+			go handleConnection(mconn)
 		}
 	}
 
