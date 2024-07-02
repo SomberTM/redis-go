@@ -78,6 +78,7 @@ func deleteKeyAfter(key string, ms int) {
 func handleCommand(ctx RequestContext) {
 	raw := ctx.Decode()
 	command, args := strings.ToUpper(raw[0]), raw[1:]
+	fmt.Println("Handling command", command, "with args", args)
 
 	switch command {
 		case "PING":
@@ -144,20 +145,16 @@ func pargsToMap() map[string] string {
 
 var role string = "master"
 
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
 
 	args := pargsToMap()
 
-	port, ok := args["port"]
-	if !ok {
+	port, portok := args["port"]
+	if !portok {
 		port = "6379"
-	}
-
-	_, ok = args["replicaof"]
-	if ok {
-		role = "slave"
 	}
 
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", port))
@@ -166,6 +163,30 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("Listening on port", port)
+
+
+	master_info, replicaok := args["replicaof"]
+	if replicaok {
+		role = "slave"
+		host, port, found := strings.Cut(master_info, " ")
+		if found {
+			if host == "localhost" {
+				host = "0.0.0.0"
+			}
+
+			address := fmt.Sprintf("%s:%s", host, port)
+			mconn, rerr := net.Dial("tcp", address)
+			if rerr != nil {
+				fmt.Println("Failed to connect to master at", address)
+			}
+			defer mconn.Close()
+			fmt.Println("Connected to master at", address)
+
+			buf := make([]byte, 4096)
+			mconn.Write([]byte(ToRespArray([]string{ "PING" })))
+			mconn.Read(buf)
+		}
+	}
 
 	for {
 		conn, err := l.Accept()
