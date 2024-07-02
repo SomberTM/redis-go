@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+var kv map[string] string = make(map[string]string)
+
 type RequestContext struct {
 	conn net.Conn
 	raw []byte
@@ -76,6 +78,16 @@ func handleCommand(ctx RequestContext) {
 			ctx.conn.Write([]byte(ToSimpleString("PONG")))
 		case "ECHO":
 			ctx.conn.Write([]byte(ToBulkString(args[0])))
+		case "SET":
+			kv[args[0]] = args[1]
+			ctx.conn.Write([]byte(OkSimpleString))
+		case "GET":
+			v, ok := kv[args[0]]
+			if ok {
+				ctx.conn.Write([]byte(ToBulkString(v)))
+			} else {
+				ctx.conn.Write([]byte(NilBulkString))
+			}
 	}
 }
 
